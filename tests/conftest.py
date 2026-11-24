@@ -56,6 +56,9 @@ def _isolate_everos_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     ``setenv`` / ``delenv`` runs inside the test body, after this fixture.
     """
     monkeypatch.setenv("EVEROS_ROOT", str(tmp_path))
+    # Keep MemTrace diffs on the request path so tests stay deterministic;
+    # the background worker has its own dedicated tests.
+    monkeypatch.setenv("EVEROS_MEMTRACE_SYNC_MODE", "inline")
 
 
 def _reset_table_write_locks() -> None:

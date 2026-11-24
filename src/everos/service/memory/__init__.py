@@ -226,6 +226,15 @@ class MemoryService:
                     raise DeletionIncompleteError(
                         "input log cleanup failed; resend the deletion"
                     ) from exc
+            tracker = getattr(self, "_memtrace_tracker", None)
+            if tracker is not None and getattr(tracker, "enabled", False):
+                await tracker.on_delete(
+                    app_id=app_id,
+                    project_id=project_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                )
             return result
 
         task = self._extractions.supervise(
@@ -271,10 +280,16 @@ class MemoryService:
             label="memory_delete_by_ids",
         )
         try:
-            return await asyncio.shield(task)
+            deleted = await asyncio.shield(task)
         except asyncio.CancelledError:
             logger.warning("memory_delete_by_ids_continues_after_cancel")
             raise
+        tracker = getattr(self, "_memtrace_tracker", None)
+        if deleted and tracker is not None and getattr(tracker, "enabled", False):
+            await tracker.on_delete_by_ids(
+                app_id=app_id, project_id=project_id, ids=ids
+            )
+        return deleted
 
     async def finish_interrupted_deletions(
         self, *, skip: Callable[[Scope], bool] | None = None

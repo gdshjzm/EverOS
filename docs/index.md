@@ -55,6 +55,7 @@ specific thing (drain a queue, recover from a stuck row, etc.).
 | [windows.zh.md](windows.zh.md) | Chinese mirror of the Windows / WSL2 guide |
 | [github-sync.md](github-sync.md) | Guardrails for refreshing GitHub from internal exports without overwriting GitHub-only workflow files |
 | [memtrace-graphs.md](memtrace-graphs.md) | Export MemTrace execution graphs with the default black/white, per-query, top-2 layout |
+| [memtrace-instrumentation.md](memtrace-instrumentation.md) | MemTrace developer guide — enable tracing, read graphs, instrument new paths ([zh-CN mirror](memtrace-instrumentation.zh-CN.md)) |
 | [benchmarks/README.md](../benchmarks/README.md) | Benchmarks (LoCoMo, LongMemEval, EverMemBench, SubtleMemory) — get the data, configure, smoke-test, reproduce |
 | [benchmarks/locomo.md](../benchmarks/locomo.md) | LoCoMo results in detail — accuracy and search time across models and retrieval methods, batch or step boundary detection, write latency |
 

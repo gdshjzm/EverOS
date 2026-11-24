@@ -1,5 +1,7 @@
 # EverOS MemTrace：开发者接入指南
 
+> 本文是 [memtrace-instrumentation.md](memtrace-instrumentation.md)（英文原版）的中文镜像。
+
 MemTrace 是我们ZJUNLP实验室的工作，它相当于是为 EverOS 增加了一条可回看的“记忆流水线”。这个pipeline把一次对话从写入、整理、保存，到下一次检索和回答的关键数据串起来，并导出为可查看、可合并、可供归因工具消费的执行图。
 
 本文面向需要开发、调试或评估 EverOS 的工程师， 本文内容包括：
@@ -52,7 +54,7 @@ MemTrace 默认关闭，只在需要时按进程打开：
 export EVEROS_MEMTRACE_ENABLED=1
 ```
 
-只用于调试和评测，不要在生产环境打开：每次 `/memory/add`、`/memory/flush`、`/memory/search` 返回前都会在一把进程级锁里对比整个记忆根，耗时随 Markdown 文件数增长，并发请求会互相等待；导出的图保留消息原文和记忆正文，`/memory/delete` 和清空数据（purge）都不会删除导出目录，需要自行删除。详见 [memtrace-graphs.md](memtrace-graphs.md#enabling-tracing)。
+只用于调试和评测，不要在生产环境打开：导出的图会保留消息原文和记忆正文，且每次导出都有延迟和磁盘开销。`/memory/delete` 和清空数据（purge）现在会清理导出（删除该范围的图、在其他图里把对应条目脱敏），但追踪关闭期间删除的数据不会留下任何信号，这种情况需要自行删除导出目录。详见 [memtrace-graphs.md](memtrace-graphs.md#enabling-tracing)。
 
 图默认写到 `<memory-root>/memtrace/`。调试时可以指定一个独立目录：
 
@@ -61,7 +63,7 @@ export EVEROS_MEMTRACE_ENABLED=1
 export EVEROS_MEMTRACE_DIR=/tmp/everos-memtrace
 ```
 
-启动 EverOS，正常执行几次 `/memory/add`、`/memory/flush` 和 `/memory/search`。请求结束后，在上述目录中可以看到一个或多个 `.json` 图文件。服务关闭时，API lifespan 会再做一次同步，补上最后的 Markdown 变化。
+启动 EverOS，正常执行几次 `/memory/add`、`/memory/flush` 和 `/memory/search`。请求结束后，在上述目录中可以看到一个或多个 `.json` 图文件。请求钩子只做内存记录，Markdown 差分和导出由后台合并worker完成；服务关闭时，API lifespan 会再做一次同步，补上最后的 Markdown 变化。需要确定性的本地检查时，可以设置 `EVEROS_MEMTRACE_SYNC_MODE=inline` 把差分放回请求路径。
 
 ### 用图做一次本地检查
 
@@ -138,11 +140,12 @@ export EVEROS_MEMTRACE_DIR=/tmp/everos-memtrace
 
 ## 运行成本与边界
 
-- **它不是零成本日志。** add、flush、search 请求结束时会扫描 memory root，并对脏图做序列化；启用后会增加一定延迟和磁盘占用。
+- **它不是零成本日志。** 请求钩子做内存记录，后台 worker 会扫描 memory root 并对脏图做序列化；启用后会增加一定延迟和磁盘占用。进程启动后的第一次扫描会解析全部 Markdown 文件。
 - **它不是完整录屏。** 当前不会自动保存所有 LLM prompt、原始 response、每轮 retry、OME 内部演化、LanceDB/embedding 的每个索引步骤，也不会自动记录回答模型。
 - **文件差分是后验观察。** 两次扫描之间发生又被覆盖的中间状态可能不可见；`file_diff` 不能单独证明因果关系。
 - **多进程需要规划写入方式。** 文件锁可以避免导出文件写坏，但不会合并不同 worker 的内存图。生产环境请选择单写者，或为每个 worker 指定独立的 `EVEROS_MEMTRACE_DIR`。
-- **图可能包含正文。** 消息、记忆和回答内容可能出现在 JSON 中。共享图或提交 issue 前，请按数据敏感级别设置目录权限并做好脱敏。
+- **图是有上限的。** 导出会按 `EVEROS_MEMTRACE_MAX_GRAPH_NODES`（默认 20000，0 表示不限制）裁剪：先裁最旧的检索会话，再裁被取代的旧版本，最新状态始终保留。
+- **图可能包含正文。** 消息、记忆和回答内容可能出现在 JSON 中。删除或清空记忆会移除或脱敏对应节点，但共享图或提交 issue 前，请按数据敏感级别设置目录权限并做好脱敏。
 
 如果项目只需要 EverOS 的正常记忆能力，可以不安装 `memtrace` extra，核心路径照常运行。安装并启用它的主要收益，是在出现“记忆为什么不对”或“回答为什么错”时，多一条可以复盘的证据链。
 
@@ -153,12 +156,14 @@ export EVEROS_MEMTRACE_DIR=/tmp/everos-memtrace
 ```bash
 .venv/bin/python -m pytest -q \
   tests/unit/test_service/test_memorize_memtrace_hook.py \
+  tests/unit/test_service/test_memtrace_delete_hook.py \
   tests/unit/test_memory/test_extract/test_trace.py \
   tests/unit/test_memory/test_search/test_trace.py \
   tests/unit/test_infra/test_memtrace_no_split.py \
   tests/unit/test_infra/test_memtrace_boundary_decision.py \
   tests/unit/test_infra/test_memtrace_buffer_lifecycle.py \
-  tests/unit/test_infra/test_memtrace_regressions.py
+  tests/unit/test_infra/test_memtrace_regressions.py \
+  tests/unit/test_infra/test_memtrace_delete_purge.py
 ```
 
 新增插桩后，至少补充一条对应的成功、空结果或失败测试，并检查导出的 JSON 能被 `smartcomment.runtime.ExecNetwork.import_graph()` 重新读取。更完整的图归因示例见 [memtrace-graphs.md](memtrace-graphs.md)，历史审阅记录见 [memtrace-attribution-review.zh-CN.md](memtrace-attribution-review.zh-CN.md)。

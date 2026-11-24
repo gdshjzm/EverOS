@@ -448,6 +448,7 @@ def build_application(
         engine=engine,
         fence=fence,
         input_log=input_log,
+        memtrace_tracker=memtrace_tracker,
     )
     vector_tables = index.repositories.with_vectors()
     return Application(

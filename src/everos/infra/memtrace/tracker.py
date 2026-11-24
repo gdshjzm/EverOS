@@ -227,6 +227,19 @@ _MAX_TRACKED_MESSAGES_PER_SESSION = 10_000
 # exception cannot bloat the exported graph.
 _MAX_ERROR_MESSAGE_CHARS = 500
 
+# Tombstone that replaces message/entry text when a memory is deleted or its
+# scope is purged: the graph keeps the node (attribution stays truthful) but
+# no longer holds the user's raw text.
+_REDACTED = "[redacted: memory deleted]"
+
+# Snapshot fields that hold user text and are scrubbed by redaction.
+_REDACTABLE_FIELDS = ("content", "body", "text")
+
+# Sync modes for the markdown diff: ``inline`` diffs inside the request hook
+# (deterministic; used by tests), ``background`` hands the diff to a single
+# coalescing worker so requests never pay for the scan.
+_SYNC_MODES = ("background", "inline")
+
 _ENTRY_KIND_COMMENT = {
     "episode": "A narrative memory extracted from a conversation.",
     "atomic_fact": "A factual statement extracted from a conversation episode.",
@@ -495,9 +508,34 @@ class MemTraceTracker:
         self._event_seq = 0
         self._entry_observations: dict[ScopedIdentity, dict[str, Any]] = {}
         # Which hook is driving the current file diff (``add`` / ``flush`` /
-        # ``search`` / ``shutdown`` / ``manual``); set by ``_sync_files``,
-        # read by the file-diff op metadata.
+        # ``search`` / ``delete`` / ``shutdown`` / ``manual``); set by
+        # ``_sync_files``, read by the file-diff op metadata.
         self._trigger = "manual"
+        # Diff scheduling: ``background`` (default) coalesces request-driven
+        # diffs onto one worker so adds/searches never scan on the response
+        # path; ``inline`` keeps the old synchronous behaviour (tests).
+        self._sync_mode = (
+            os.environ.get("EVEROS_MEMTRACE_SYNC_MODE", "background").strip().lower()
+        )
+        if self._sync_mode not in _SYNC_MODES:
+            logger.warning(
+                "memtrace_bad_sync_mode",
+                value=self._sync_mode,
+                fallback="background",
+            )
+            self._sync_mode = "background"
+        # Triggers queued for the background worker and its task handle.
+        self._pending_triggers: set[str] = set()
+        self._sync_task: asyncio.Task[None] | None = None
+        # Per-graph node cap (0 = unbounded). Retrieval sessions are the
+        # highest-churn records, so pruning drops the oldest of them first.
+        try:
+            self._max_graph_nodes = int(
+                os.environ.get("EVEROS_MEMTRACE_MAX_GRAPH_NODES", "20000")
+            )
+        except ValueError:
+            logger.warning("memtrace_bad_max_graph_nodes", fallback="20000")
+            self._max_graph_nodes = 20_000
 
     # ── public hooks ─────────────────────────────────────────────────────
 
@@ -612,7 +650,7 @@ class MemTraceTracker:
             await self._record_construction_events(construction_events, request_id)
             if buffer_persisted is not None and not is_final:
                 await self._record_buffer_state(buffer_persisted, request_id=request_id)
-            await self._sync_files(trigger="flush" if is_final else "add")
+            await self._sync(trigger="flush" if is_final else "add")
             if is_final:
                 # A flush is its own request-level event: record it even
                 # when the diff found nothing, so an empty flush stays
@@ -661,7 +699,7 @@ class MemTraceTracker:
             for event in construction_events or []:
                 if event["phase"] == "buffer_persisted":
                     await self._record_buffer_state(event, request_id=request_id)
-            await self._sync_files(trigger="flush" if is_final else "add")
+            await self._sync(trigger="flush" if is_final else "add")
             error_metadata: dict[str, Any] = {
                 "session_id": session_id,
                 "is_final": is_final,
@@ -762,7 +800,7 @@ class MemTraceTracker:
         if not self.enabled:
             return
         try:
-            await self._sync_files(trigger="search")
+            await self._sync(trigger="search")
             await self._record_search(req, resp, stages=stages, request_id=request_id)
         except Exception as exc:
             logger.warning("memtrace_on_search_failed", error=str(exc))
@@ -785,7 +823,7 @@ class MemTraceTracker:
         if not self.enabled:
             return
         try:
-            await self._sync_files(trigger="search")
+            await self._sync(trigger="search")
             await self._record_search_error(
                 req, stages=stages, error=error, request_id=request_id
             )
@@ -793,7 +831,7 @@ class MemTraceTracker:
             logger.warning("memtrace_on_search_error_failed", error=str(exc))
 
     async def sync_now(self) -> None:
-        """Final sync for shutdown: one last diff plus a dirty-graph flush.
+        """Final sync for shutdown: drain, one last diff, dirty-graph flush.
 
         Catches asynchronous writes (OME) that landed after the last
         request and exports every graph dirtied since the previous flush.
@@ -802,10 +840,417 @@ class MemTraceTracker:
         if not self.enabled:
             return
         try:
+            await self.wait_idle()
             await self._sync_files(trigger="shutdown")
             await self._flush_dirty_graphs()
         except Exception as exc:
             logger.warning("memtrace_sync_now_failed", error=str(exc))
+
+    # ── diff scheduling ──────────────────────────────────────────────────
+
+    async def _sync(self, *, trigger: str) -> None:
+        """Diff now (``inline`` mode) or hand it to the background worker."""
+        if self._sync_mode == "inline":
+            await self._sync_files(trigger=trigger)
+            return
+        self._schedule_sync(trigger)
+
+    def _schedule_sync(self, trigger: str) -> None:
+        """Queue a background diff; bursts coalesce into one scan.
+
+        The worker re-checks the queue after every scan, so a request that
+        lands mid-scan schedules exactly one follow-up. No await between the
+        queue read and the task check anywhere in this path, so the
+        single-threaded event loop cannot lose a wakeup.
+        """
+        self._pending_triggers.add(trigger)
+        task = self._sync_task
+        if task is None or task.done():
+            self._sync_task = asyncio.create_task(self._sync_worker())
+
+    async def _sync_worker(self) -> None:
+        """Drain queued diff requests until none arrive mid-scan."""
+        while self._pending_triggers:
+            triggers = self._pending_triggers
+            self._pending_triggers = set()
+            if "flush" in triggers:
+                trigger = "flush"
+            elif "add" in triggers:
+                trigger = "add"
+            elif "delete" in triggers:
+                trigger = "delete"
+            else:
+                trigger = sorted(triggers)[0]
+            try:
+                await self._sync_files(trigger=trigger)
+            except Exception as exc:
+                logger.warning("memtrace_background_sync_failed", error=str(exc))
+
+    async def wait_idle(self) -> None:
+        """Wait until every queued background diff has been applied."""
+        while True:
+            task = self._sync_task
+            if task is None:
+                return
+            try:
+                await task
+            except Exception as exc:  # defensive; the worker logs its own
+                logger.warning("memtrace_background_sync_failed", error=str(exc))
+            if task is self._sync_task and not self._pending_triggers:
+                self._sync_task = None
+                return
+
+    # ── delete / purge ───────────────────────────────────────────────────
+
+    async def on_delete(
+        self,
+        *,
+        app_id: str,
+        project_id: str,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        """Remove one deleted scope from the trace export (``/delete``).
+
+        The scope's own graphs — which hold the raw request messages — are
+        deleted outright. In every other graph of the same app/project, the
+        scope's entry nodes are redacted (text replaced by a tombstone) so
+        cross-session copies stop carrying the deleted content. Runs after
+        the business deletion succeeded; best-effort, never raises.
+        """
+        if not self.enabled:
+            return
+        try:
+            owners = {str(o) for o in (user_id, agent_id) if o}
+            await self._drop_graphs_in_scope(
+                app_id, project_id, owners=owners, session_id=session_id
+            )
+            self._drop_index_state(app_id, project_id, owners, session_id)
+            await self._redact_scope(
+                app_id, project_id, owners=owners, session_id=session_id
+            )
+        except Exception as exc:
+            logger.warning("memtrace_on_delete_failed", error=str(exc))
+
+    async def on_delete_by_ids(
+        self,
+        *,
+        app_id: str,
+        project_id: str,
+        ids: Sequence[str],
+    ) -> None:
+        """Redact single memories removed by ``/delete_by_ids``.
+
+        Every version of every matching node is scrubbed in every graph of
+        the app/project — canonical write-path nodes and cross-session
+        copies alike. A response id is the bare entry id while write-path
+        identities are ``{owner}_{entry_id}``, so both forms match.
+        Best-effort, never raises.
+        """
+        if not self.enabled:
+            return
+        try:
+            wanted = {str(raw) for raw in ids if raw}
+            if not wanted:
+                return
+            await self._redact_scope(
+                app_id,
+                project_id,
+                owners=None,
+                session_id=None,
+                identity_match=lambda identity: (
+                    identity in wanted
+                    or any(identity.endswith(f"_{raw}") for raw in wanted)
+                ),
+            )
+        except Exception as exc:
+            logger.warning("memtrace_on_delete_by_ids_failed", error=str(exc))
+
+    async def on_purge(
+        self,
+        *,
+        app_id: str | None = None,
+        project_id: str | None = None,
+    ) -> None:
+        """Remove every graph in a purged scope (``/purge`` finished).
+
+        ``None`` ids mean "everything below": a space purge clears the whole
+        export directory. Cross-graph copies never leave their app/project,
+        so dropping the scope's graphs removes every trace of its content.
+        Runs after the purge job succeeded; best-effort, never raises.
+        """
+        if not self.enabled:
+            return
+        try:
+            await self._drop_graphs_in_scope(
+                app_id, project_id, owners=None, session_id=None
+            )
+            self._drop_index_state(app_id, project_id, None, None)
+        except Exception as exc:
+            logger.warning("memtrace_on_purge_failed", error=str(exc))
+
+    async def _graph_keys_in_scope(
+        self, app_id: str | None, project_id: str | None
+    ) -> list[GraphKey]:
+        """Every graph key of a scope, including graphs only on disk."""
+        keys = {
+            key
+            for key in set(self._graphs) | set(self._locks) | set(self._buffers)
+            if (app_id is None or key[0] == app_id)
+            and (project_id is None or key[1] == project_id)
+        }
+        for meta in await asyncio.to_thread(self._read_exported_graph_metas):
+            if (app_id is None or meta[0] == app_id) and (
+                project_id is None or meta[1] == project_id
+            ):
+                keys.add(meta)
+        return sorted(keys)
+
+    def _read_exported_graph_metas(self) -> list[GraphKey]:
+        """Scope keys of every exported graph file (runs in a worker thread)."""
+        metas: list[GraphKey] = []
+        if not self._out_dir.exists():
+            return metas
+        for path in self._out_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            metadata = data.get("metadata") or {}
+            keys = (
+                str(metadata.get("app_id") or ""),
+                str(data.get("project_id") or ""),
+                str(data.get("user_id") or ""),
+                str(metadata.get("session_bucket") or ""),
+            )
+            if all(keys):
+                metas.append(keys)
+        return metas
+
+    async def _drop_graphs_in_scope(
+        self,
+        app_id: str | None,
+        project_id: str | None,
+        *,
+        owners: set[str] | None,
+        session_id: str | None,
+    ) -> None:
+        """Delete the matching graphs, in memory and on disk."""
+        for key in await self._graph_keys_in_scope(app_id, project_id):
+            if owners and key[2] not in owners:
+                continue
+            if session_id is not None and key[3] != session_id:
+                continue
+            self._graphs.pop(key, None)
+            self._locks.pop(key, None)
+            self._buffers.pop(key, None)
+            self._query_seq.pop(key, None)
+            self._dirty_keys.discard(key)
+            await asyncio.to_thread(self._remove_graph_files, self._graph_path(key))
+
+    @staticmethod
+    def _remove_graph_files(path: Path) -> None:
+        """Delete one exported graph under its write lock (worker thread)."""
+        lock_path = path.with_suffix(".json.lock")
+        try:
+            with portalocker.Lock(str(lock_path), mode="w", timeout=30):
+                path.unlink(missing_ok=True)
+            lock_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "memtrace_graph_remove_failed", path=str(path), error=str(exc)
+            )
+
+    def _drop_index_state(
+        self,
+        app_id: str | None,
+        project_id: str | None,
+        owners: set[str] | None,
+        session_id: str | None,
+    ) -> None:
+        """Drop the in-memory indexes a dropped scope could resurrect from.
+
+        Left-over entry snapshots would let the next diff record tombstone
+        mutations into freshly recreated graphs for a scope the user just
+        erased.
+        """
+
+        def in_scope(snapshot: Mapping[str, Any]) -> bool:
+            if owners and str(snapshot.get("owner_id") or "") not in owners:
+                return False
+            return (
+                session_id is None
+                or str(snapshot.get("session_id") or "") == session_id
+            )
+
+        for scoped_identity, snapshot in list(self._entries.items()):
+            if self._id_in_scope(scoped_identity, app_id, project_id) and in_scope(
+                snapshot
+            ):
+                self._entries.pop(scoped_identity, None)
+                self._entry_file.pop(scoped_identity, None)
+        for scoped_identity, snapshot in list(self._artifacts.items()):
+            if self._id_in_scope(scoped_identity, app_id, project_id) and in_scope(
+                snapshot
+            ):
+                self._artifacts.pop(scoped_identity, None)
+                self._artifact_file.pop(scoped_identity, None)
+        for scoped_identity in list(self._entry_observations):
+            if self._id_in_scope(scoped_identity, app_id, project_id):
+                self._entry_observations.pop(scoped_identity, None)
+        for scoped_identity, snapshot in list(self._messages.items()):
+            if not self._id_in_scope(scoped_identity, app_id, project_id):
+                continue
+            if owners and str(snapshot.get("sender_id") or "") not in owners:
+                continue
+            if (
+                session_id is not None
+                and str(snapshot.get("session_id") or "") != session_id
+            ):
+                continue
+            self._messages.pop(scoped_identity, None)
+            self._bound_messages.discard(scoped_identity)
+        for app, project, session in list(self._session_messages):
+            if self._id_in_scope((app, project, ""), app_id, project_id) and (
+                session_id is None or session == session_id
+            ):
+                self._session_messages.pop((app, project, session), None)
+
+    @staticmethod
+    def _id_in_scope(
+        scoped_identity: ScopedIdentity, app_id: str | None, project_id: str | None
+    ) -> bool:
+        """Whether one scoped index identity sits inside the scope."""
+        app, project, _ = scoped_identity
+        return (app_id is None or app == app_id) and (
+            project_id is None or project == project_id
+        )
+
+    async def _redact_scope(
+        self,
+        app_id: str,
+        project_id: str,
+        *,
+        owners: set[str] | None,
+        session_id: str | None,
+        identity_match: Callable[[str], bool] | None = None,
+    ) -> None:
+        """Scrub the text of every matching node in the scope's graphs.
+
+        Matches by node payload (owner/session) or by identity. Copied
+        revisions live next to their canonical node only inside the same
+        app/project (``_memory_source`` never crosses that boundary), so one
+        pass over the scope's graphs catches every copy.
+        """
+        for key in await self._graph_keys_in_scope(app_id, project_id):
+            graph = await self._get_graph(key)
+            scrubbed = self._scrub_graph(
+                graph,
+                owners=owners,
+                session_id=session_id,
+                identity_match=identity_match,
+            )
+            if scrubbed:
+                logger.info(
+                    "memtrace_nodes_redacted",
+                    graph=str(self._graph_path(key)),
+                    count=scrubbed,
+                )
+                await asyncio.to_thread(self._export, key, graph)
+                self._dirty_keys.discard(key)
+
+    def _scrub_graph(
+        self,
+        graph: ExecNetwork,
+        *,
+        owners: set[str] | None,
+        session_id: str | None,
+        identity_match: Callable[[str], bool] | None,
+    ) -> int:
+        """Redact matching node payloads in place; how many were scrubbed.
+
+        Two passes: first collect the in-scope identities (canonical nodes,
+        matched by owner/session or by ``identity_match``), then scrub every
+        node carrying one of them — including search-response hit nodes,
+        which quote the returned text under ``memory_identity``.
+        """
+        payloads: list[tuple[Any, dict[str, Any]]] = []
+        for node in graph.get_all_nodes():
+            try:
+                payload = json.loads(node.raw_value or node.value)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                payloads.append((node, payload))
+        identities: set[str] = set()
+        for _node, payload in payloads:
+            identity = str(payload.get("id") or "")
+            if identity_match is not None:
+                if identity_match(identity) or identity_match(
+                    str(payload.get("memory_identity") or "")
+                ):
+                    identities.add(identity)
+                    memory_identity = str(payload.get("memory_identity") or "")
+                    if memory_identity:
+                        identities.add(memory_identity)
+                continue
+            if owners and str(payload.get("owner_id") or "") not in owners:
+                continue
+            if (
+                session_id is not None
+                and str(payload.get("session_id") or "") != session_id
+            ):
+                continue
+            if identity:
+                identities.add(identity)
+        scrubbed = 0
+        for node, payload in payloads:
+            if (
+                str(payload.get("id") or "") in identities
+                or str(payload.get("memory_identity") or "") in identities
+            ):
+                changed = self._scrub_payload(payload)
+            else:
+                # Assembled context nodes quote passage texts by entry id.
+                changed = self._scrub_nested(payload, identities)
+            if changed:
+                # RuntimeVariable exposes the stored string read-only; the
+                # wrapped schema node is the only writable handle.
+                node._variable.value = _encode(payload)
+                scrubbed += 1
+        return scrubbed
+
+    @staticmethod
+    def _scrub_nested(payload: dict[str, Any], identities: set[str]) -> bool:
+        """Redact passage texts quoting a scrubbed entry inside a context."""
+        passages = payload.get("passages")
+        if not isinstance(passages, list):
+            return False
+        changed = False
+        for passage in passages:
+            if not isinstance(passage, dict):
+                continue
+            if str(passage.get("id") or "") not in identities:
+                continue
+            text = passage.get("text")
+            if isinstance(text, str) and text and text != _REDACTED:
+                passage["text"] = _REDACTED
+                changed = True
+        return changed
+
+    @staticmethod
+    def _scrub_payload(payload: dict[str, Any]) -> bool:
+        """Replace the text-bearing fields of one snapshot with a tombstone."""
+        changed = False
+        for field in _REDACTABLE_FIELDS:
+            text = payload.get(field)
+            if isinstance(text, str) and text and text != _REDACTED:
+                payload[field] = _REDACTED
+                changed = True
+        if changed:
+            payload["redacted"] = True
+        return changed
 
     # ── QA recording (answer / evaluation) ─────────────────────────────
 
@@ -3211,10 +3656,12 @@ class MemTraceTracker:
                 mutation_name=f"delete_{identity}",
                 mutation_category="deletion",
                 mutation_comment=(
-                    "The memory entry was deleted from the markdown store."
+                    "The memory entry was deleted from the markdown store; "
+                    "its text was redacted from the trace."
                 ),
                 mutation_metadata=self._file_diff_metadata(),
             ):
+                self._scrub_payload(target)
                 target["deleted"] = True
 
         before = dict(target)
@@ -3230,6 +3677,17 @@ class MemTraceTracker:
             target.clear()
             target.update(before)
             raise
+        # The tombstone mutation only redacts the latest version; the older
+        # versions (and any hit node quoting the text) still hold it, so
+        # scrub them in place too. The batched flush persists the result.
+        graph = self._graphs.get(key)
+        if graph is not None:
+            self._scrub_graph(
+                graph,
+                owners=None,
+                session_id=None,
+                identity_match=lambda candidate, ident=identity: candidate == ident,
+            )
         self._entries.pop(scoped_identity, None)
         self._entry_file.pop(scoped_identity, None)
         self._artifacts.pop(scoped_identity, None)
@@ -3472,7 +3930,11 @@ class MemTraceTracker:
         write. The lock does not merge graphs — each process still exports
         its own in-memory instance — so multi-writer deployments should
         still prefer a single writer or per-worker export dirs.
+
+        The graph is pruned to ``EVEROS_MEMTRACE_MAX_GRAPH_NODES`` first, so
+        long sessions keep both the file size and each rewrite bounded.
         """
+        self._prune_graph(graph)
         data = graph.export_graph()
         describe_sentinels(data)
         payload = data.get("data", {})
@@ -3498,3 +3960,44 @@ class MemTraceTracker:
                 json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             tmp_path.replace(path)
+
+    def _prune_graph(self, graph: ExecNetwork) -> None:
+        """Bound one graph's size before it is exported.
+
+        Retrieval sessions are per-request, high-churn records, so the
+        oldest of them go first; superseded versions of a variable go next
+        (the latest version always stays). Construction history is only
+        touched when even that is not enough, and the drop is logged.
+        """
+        cap = self._max_graph_nodes
+        if cap <= 0 or graph.node_count <= cap:
+            return
+        sessions = sorted(
+            graph.get_all_sessions(),
+            key=lambda session: (str(session.created_at), session.session_id),
+        )
+        for session in sessions:
+            if graph.node_count <= cap:
+                return
+            if session.category != "memory_retrieval":
+                continue
+            graph.remove_session(session.session_id)
+        if graph.node_count <= cap:
+            return
+        versions_by_name: dict[str, list[Any]] = {}
+        for node in graph.get_all_nodes():
+            versions_by_name.setdefault(node.name, []).append(node)
+        for versions in versions_by_name.values():
+            if len(versions) <= 1:
+                continue
+            versions.sort(key=lambda node: (str(node.created_at), node.version))
+            for node in versions[:-1]:
+                if graph.node_count <= cap:
+                    return
+                graph.remove_variable(node.full_node_id)
+        if graph.node_count > cap:
+            logger.warning(
+                "memtrace_graph_prune_exhausted",
+                nodes=graph.node_count,
+                cap=cap,
+            )

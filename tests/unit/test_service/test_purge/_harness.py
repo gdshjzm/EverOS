@@ -102,8 +102,8 @@ class Purge:
         svc._runner = runner
         return runner
 
-    async def run_to_end(self, job_id: str, limit_s: float = 10) -> str:
-        runner = self.runner()
+    async def run_to_end(self, job_id: str, limit_s: float = 10, **kw: Any) -> str:
+        runner = self.runner(**kw)
         runner.start()
         try:
             async with asyncio.timeout(limit_s):

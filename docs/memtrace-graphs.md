@@ -13,16 +13,24 @@ export EVEROS_MEMTRACE_DIR=/path/to/memtrace     # default: <memory-root>/memtra
 
 Use it for debugging and benchmark runs, not in production:
 
-- **Latency.** Every `/memory/add`, `/memory/flush` and `/memory/search` diffs
-  the whole memory root before it returns, under one process-wide lock. The
-  cost grows with the number of markdown files, and concurrent requests wait
-  for each other's diff. The first request after a start parses every file.
-- **Raw text.** The graphs keep message content and memory text.
-  `/memory/delete` and purge do not touch the export directory; delete it
-  yourself when the data it traced is deleted.
-- **Growth.** One graph per owner and session is rewritten after each request
-  and is never trimmed, so long sessions make the exports, and each rewrite,
-  larger.
+- **Latency.** Request hooks only record in memory; the markdown diff and
+  the graph exports run on a single background worker that coalesces bursts,
+  so adds and searches do not pay for the scan. The first scan after a start
+  still parses every file, and a request recorded just before a write lands
+  may only link it on the next scan. Set `EVEROS_MEMTRACE_SYNC_MODE=inline`
+  to move the diff back onto the request path (deterministic; the tests use
+  it). Shutdown drains the worker and runs a final diff.
+- **Raw text.** The graphs keep message content and memory text while the
+  memories exist. `/memory/delete` drops the scope's own graphs and redacts
+  its entries everywhere else (text is replaced by a tombstone, the node
+  stays so attribution keeps working); `/memory/delete_by_ids` redacts the
+  listed memories in every graph of the app/project; a finished purge
+  removes the purged scope's graphs outright. Deletes and purges issued
+  while tracing was off cannot be seen — remove the export directory
+  yourself in that case.
+- **Growth.** Exports are pruned to `EVEROS_MEMTRACE_MAX_GRAPH_NODES` nodes
+  per graph (default 20000, 0 disables): the oldest retrieval sessions go
+  first, then superseded versions, so the latest state always survives.
 - **Workers.** Each process keeps its own in-memory graphs. With several
   workers, run a single writer or give each worker its own
   `EVEROS_MEMTRACE_DIR`.

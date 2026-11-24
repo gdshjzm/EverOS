@@ -78,6 +78,7 @@ class PurgeService:
     engine: OfflineEngine
     fence: DeleteFence
     input_log: Any = None
+    memtrace_tracker: Any = None
     _nonces: dict[str, _Nonce] = field(default_factory=dict, init=False)
     _reserved: set[str] = field(default_factory=set, init=False)
     _recording: asyncio.Event | None = field(default=None, init=False)
@@ -316,6 +317,7 @@ class PurgeService:
             fence=self.fence,
             scope_of=self.scope_of,
             input_log=self.input_log,
+            memtrace_tracker=self.memtrace_tracker,
         )
         self._runner.start()
 

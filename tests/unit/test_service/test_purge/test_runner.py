@@ -535,3 +535,23 @@ async def test_rerun_after_a_kill_mid_step2_succeeds(storage: Storage) -> None:
     assert not trash.exists()
     s_left = (await p.service.request("project", "a1", "p1")).summary
     assert s_left.markdown_total == 0
+
+
+class _StubTracker:
+    enabled = True
+
+    def __init__(self) -> None:
+        self.purged: list[tuple[str | None, str | None]] = []
+
+    async def on_purge(
+        self, *, app_id: str | None = None, project_id: str | None = None
+    ) -> None:
+        self.purged.append((app_id, project_id))
+
+
+async def test_memtrace_graphs_dropped_after_success(storage: Storage) -> None:
+    """A succeeded purge clears the scope's MemTrace export graphs too."""
+    p, job_id = await _confirmed(storage)
+    tracker = _StubTracker()
+    assert await p.run_to_end(job_id, memtrace_tracker=tracker) == "succeeded"
+    assert tracker.purged == [("a1", "p1")]

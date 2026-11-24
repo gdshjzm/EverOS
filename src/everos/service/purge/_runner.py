@@ -162,6 +162,7 @@ class PurgeRunner:
         backoff: Callable[[int], float] = _backoff,
         poll_seconds: float = 5.0,
         input_log: Any = None,
+        memtrace_tracker: Any = None,
     ) -> None:
         self._settings = settings
         self._marks = marks
@@ -174,6 +175,7 @@ class PurgeRunner:
         self._fence = fence
         self._scope_of = scope_of
         self._input_log = input_log
+        self._memtrace_tracker = memtrace_tracker
         self._backoff = backoff
         self._poll = poll_seconds
         self._task: asyncio.Task[None] | None = None
@@ -519,3 +521,14 @@ class PurgeRunner:
                 await asyncio.sleep(self._backoff(attempt))
         self._marks.lift_mark()
         logger.info("purge_finished", job_id=run.job_id, status=status, error=error)
+        tracker = self._memtrace_tracker
+        if (
+            status == "succeeded"
+            and tracker is not None
+            and getattr(tracker, "enabled", False)
+        ):
+            # Fail-safe like every tracker hook: drop the purged scope's
+            # trace graphs so no deleted content stays in the export.
+            await tracker.on_purge(
+                app_id=run.scope.app_id, project_id=run.scope.project_id
+            )
